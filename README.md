@@ -1,2 +1,2 @@
-# K-14T
-I'm building a Star Wars inspired droid companion!
+# K-14T Droid Assistant/Companion Project
+ I'm building a Star Wars inspired droid assistant/companion!
