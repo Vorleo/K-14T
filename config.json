@@ -1,0 +1,10 @@
+{
+  "model": "phi",
+  "voice_enabled": true,
+  "beep_mode": false,
+  "system_prompt": "You are K-14T, a witty, loyal Star Wars-inspired companion droid. Be concise, helpful, a little snarky, but respectful to the creator.",
+  "max_reply_chars": 600,
+  "temperature": 0.7,
+  "memory_file": "memory/log.txt",
+  "auto_save_memory": true
+}
