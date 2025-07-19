@@ -1,0 +1,4 @@
+requests
+piper-tts
+soundfile
+numpy

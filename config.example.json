@@ -1,0 +1,18 @@
+{
+  "model": "phi2",
+  "voice_enabled": true,
+  "fast_mode": false,
+  "num_predict": 40,
+  "temperature": 0.60,
+  "top_p": 0.9,
+  "callsign": "Joshua",
+  "persona_line": "You are K-14T, a concise in-universe utility droid; answer Joshua briefly and stay diegetic.",
+  "piper_voice": "voices/en_US-lessac-high.onnx",
+  "piper_config": "voices/en_US-lessac-high.onnx.json",
+  "piper_length_scale": 0.92,
+  "piper_noise_scale": 0.50,
+  "piper_noise_w": 0.60,
+  "piper_pitch_semitones": 2,
+  "max_history_pairs": 2,
+  "memory_max_injected": 2
+}

@@ -1,0 +1,10 @@
+venv/
+k14tcore/
+__pycache__/
+*.pyc
+memory/long_term.jsonl
+config.json
+voices/*.onnx
+voices/*.onnx.json
+tts_*.wav
+response*.wav
