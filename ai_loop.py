@@ -1,219 +1,138 @@
 #!/usr/bin/env python3
 """
-K-14T Interactive Droid Loop
-Layers included: persona, short history, categorized memory with relevance selection,
-memory suggestion & optional auto-saving, model switching, beep / voice modes.
+K-14T Fast Loop (Full persona once, micro persona thereafter)
+
+Features:
+- Loads full persona from persona/system_prompt.txt ONCE (first user turn).
+- After first turn uses a minimal in-code MICRO_PERSONA instead of repeating full text.
+- Optional interval-based reminder injection to keep the model on-style.
+- Limited history (last N user turns; assistant mirrored).
+- Memory relevance selection (top 3 simple overlap).
+- Output cap via num_predict for faster replies.
+- Timing instrumentation.
+- Fast mode toggle (/fast) lowers num_predict & disables voice.
 """
 
 import os
 import sys
 import time
 import json
-import argparse
 import pathlib
-from collections import deque
+import argparse
 import requests
-from gtts import gTTS   # (swap later for Piper)
-# If mpg321 / ffplay not available, install or adjust speak().
+from collections import deque
 
-# -------------------- Paths & Constants --------------------
+# -------------------- Config / Paths --------------------
 BASE_DIR = pathlib.Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "config.json"
 PERSONA_PATH = BASE_DIR / "persona" / "system_prompt.txt"
-SELF_PROFILE_PATH = BASE_DIR / "data" / "self_profile.json"
 MEMORY_FILE = BASE_DIR / "memory" / "long_term.jsonl"
-LOGS_DIR = BASE_DIR / "logs"
-LOGS_DIR.mkdir(exist_ok=True)
-
-API_ROOT = "http://localhost:11434"
-API_GENERATE = f"{API_ROOT}/api/generate"
-API_TAGS = f"{API_ROOT}/api/tags"
 
 DEFAULT_CONFIG = {
     "model": "phi:latest",
-    "beeps": False,
-    "voice": True,
-    "history_turns": 6,
+    "history_turns": 2,
     "callsign": "Joshua",
-    "memory_suggest_cooldown": 120,
-    "memory_max_facts": 300,
-    "auto_memory": False
+    "voice": False,
+    "beeps": False,
+    "num_predict": 60,
+    "temperature": 0.6,
+    "top_p": 0.9
 }
 
-FORBIDDEN_FRAGMENTS = [
-    "i am an ai", "as an ai", "language model", "large language model",
-    "i'm an ai", "model limitations"
-]
+# ------------- Micro Persona & Reminder Strategy ----------
+MICRO_PERSONA = (
+    "K-14T stays in-universe, concise (≤2 short sentences), no meta or AI talk."
+)
+# Inject micro persona every turn after first? (Set False to use interval logic)
+INJECT_MICRO_PERSONA_ALWAYS = True
+# If ALWAYS is False, inject on these modular intervals (e.g., every 4 turns)
+REMINDER_INTERVAL = 4
 
-MAX_WORDS = 90
-INTRO_KEYWORDS = ["utility droid", "belt-mounted", "designation", "portable"]
-
-STOP_WORDS = {
-    "the","a","an","and","or","but","to","of","in","on","for","with","is",
-    "it","that","this","i","you","me","my","your","we","our","are","be"
-}
-
-BEEP_VOCAB = {
-    "affirmative": "*beep-chirp*",
-    "negative": "*boop-low*",
-    "neutral": "*chirp*",
-}
-
-# -------------------- Persona & Config --------------------
-def load_persona():
-    return PERSONA_PATH.read_text(encoding="utf-8").strip() if PERSONA_PATH.exists() else "You are K-14T."
-
-def load_self_profile():
-    if SELF_PROFILE_PATH.exists():
-        try:
-            return json.loads(SELF_PROFILE_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            pass
-    return {}
-
+# -------------------- Load Config ------------------------
 def load_config():
     if CONFIG_PATH.exists():
         try:
             data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            merged = {**DEFAULT_CONFIG, **data}
-            return merged
+            return {**DEFAULT_CONFIG, **data}
         except Exception:
-            print("[WARN] Could not parse config.json; using defaults.")
+            print("[WARN] Bad config.json; defaults used.")
     return dict(DEFAULT_CONFIG)
 
 def save_config(cfg):
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2), encoding="utf-8")
 
-# -------------------- Memory Helpers --------------------
-def norm(text):  # simple normalization for duplicate check
-    return " ".join(text.lower().split())
+# -------------------- Persona Handling -------------------
+_persona_warned = False
+def load_full_persona():
+    global _persona_warned
+    if PERSONA_PATH.exists():
+        txt = PERSONA_PATH.read_text(encoding="utf-8").strip()
+        return txt
+    if not _persona_warned:
+        print("[WARN] persona/system_prompt.txt missing; only micro persona will be used.")
+        _persona_warned = True
+    return ""
 
-def categorize_fact(fact: str) -> str:
-    f = fact.lower()
-    if any(p in f for p in ["prefer", "favorite", "like", "love", "hate", "don't like"]):
-        return "preference"
-    if any(p in f for p in ["my name", "i am ", "i'm ", "i live", "i work", "i was born"]):
-        return "profile"
-    if any(p in f for p in ["k-14t", "droid", "hardware", "project", "raspberry", "servo", "phase 1", "phase one"]):
-        return "project"
-    return "misc"
+# -------------------- Memory -----------------------------
+_memory_cache = []
+_memory_norm_set = set()
 
-def load_memory(limit=None):
+def _norm(s: str) -> str:
+    return " ".join(s.lower().split())
+
+def load_memory():
     if not MEMORY_FILE.exists():
-        return []
-    items = []
+        return
     for ln in MEMORY_FILE.read_text(encoding="utf-8").splitlines():
-        try: items.append(json.loads(ln))
-        except: continue
-    return items[-limit:] if limit else items
-
-def memory_exists(fact: str) -> bool:
-    nf = norm(fact)
-    for obj in load_memory():
-        if norm(obj.get("fact","")) == nf:
-            return True
-    return False
+        if not ln.strip():
+            continue
+        try:
+            obj = json.loads(ln)
+            fact = obj.get("fact") or obj.get("text") or ""
+        except Exception:
+            fact = ln.strip()
+        if fact:
+            n = _norm(fact)
+            if n not in _memory_norm_set:
+                _memory_cache.append(fact)
+                _memory_norm_set.add(n)
 
 def append_memory(fact: str):
     fact = fact.strip()
-    if not fact or memory_exists(fact):
+    if not fact:
         return False
-    entry = {
-        "ts": time.time(),
-        "fact": fact,
-        "category": categorize_fact(fact),
-        "score": 1.0
-    }
+    n = _norm(fact)
+    if n in _memory_norm_set:
+        return False
+    entry = {"ts": time.time(), "fact": fact}
+    MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
     with open(MEMORY_FILE, "a", encoding="utf-8") as f:
         json.dump(entry, f); f.write("\n")
-    prune_memory_if_needed()
+    _memory_cache.append(fact)
+    _memory_norm_set.add(n)
     return True
 
-def forget_last():
-    if not MEMORY_FILE.exists(): return False
-    lines = MEMORY_FILE.read_text(encoding="utf-8").splitlines()
-    if not lines: return False
-    MEMORY_FILE.write_text("\n".join(lines[:-1]) + ("\n" if len(lines)>1 else ""), encoding="utf-8")
-    return True
-
-def forget_all():
-    if MEMORY_FILE.exists():
-        MEMORY_FILE.write_text("", encoding="utf-8")
-        return True
-    return False
-
-def prune_memory_if_needed():
-    cfg = load_config()
-    max_facts = int(cfg.get("memory_max_facts", 300))
-    items = load_memory()
-    if len(items) <= max_facts:
-        return
-    keep = items[-max_facts:]
-    with open(MEMORY_FILE, "w", encoding="utf-8") as f:
-        for obj in keep:
-            json.dump(obj, f); f.write("\n")
-
-# -------------------- Relevance & Suggestions --------------------
-def tokenize(msg: str):
-    return [w for w in "".join(c.lower() if c.isalnum() else " " for c in msg).split()
-            if w and w not in STOP_WORDS]
-
-def select_relevant(memory_items, user_msg, max_total=10):
-    if not memory_items: return []
-    user_tokens = set(tokenize(user_msg))
-    scored = []
-    for m in memory_items:
-        fact_tokens = set(tokenize(m["fact"]))
-        overlap = len(user_tokens & fact_tokens)
-        base = overlap + 0.1  # baseline
-        if m.get("category") == "preference":
-            base += 0.3
-        scored.append((base, m))
-    pref = [m for m in memory_items if m.get("category") == "preference"][-3:]
-    scored.sort(key=lambda x: x[0], reverse=True)
-    selected = []
-    for base, m in scored:
-        if base <= 0.1 and len(selected) >= len(pref):
-            continue
-        selected.append(m)
-        if len(selected) >= max_total: break
-    for p in pref:
-        if p not in selected and len(selected) < max_total:
-            selected.append(p)
-    return selected
-
-SUGGEST_PATTERNS = [
-    ("preference", ["i like","i love","i prefer","my favorite","i hate","i don't like"]),
-    ("profile", ["i am ","i'm ","my name","i live","i work","i was born"]),
-    ("project", ["k-14t","phase 1","phase one","the droid","raspberry pi","servo","harness"])
-]
-
-def detect_fact_candidate(user_msg: str):
-    low = user_msg.lower()
-    for cat, pats in SUGGEST_PATTERNS:
-        for p in pats:
-            if p in low:
-                return user_msg.strip()
-    return None
-
-# -------------------- Model Helpers --------------------
-def fetch_available_models():
-    try:
-        r = requests.get(API_TAGS, timeout=3)
-        r.raise_for_status()
-        tags = r.json().get("models", [])
-        return [m["name"] for m in tags]
-    except Exception:
+def select_relevant(user_msg: str, limit=3):
+    if not _memory_cache:
         return []
+    u = set(w for w in user_msg.lower().split() if len(w) > 2)
+    scored = []
+    for fact in _memory_cache:
+        ft = set(fact.lower().split())
+        overlap = len(u & ft)
+        scored.append((overlap, fact))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    chosen = [f for o, f in scored if o > 0][:limit]
+    if not chosen:
+        chosen = _memory_cache[-limit:]
+    return chosen[:limit]
 
-def resolve_model(requested, available):
-    if requested in available:
-        return requested
-    if not requested.endswith(":latest") and f"{requested}:latest" in available:
-        return f"{requested}:latest"
-    return requested
+# -------------------- Model Calls ------------------------
+API_ROOT = "http://localhost:11434"
+API_GENERATE = f"{API_ROOT}/api/generate"
+API_TAGS = f"{API_ROOT}/api/tags"
 
-def wait_for_server(timeout=60):
+def wait_for_server(timeout=45):
     start = time.time()
     while time.time() - start < timeout:
         try:
@@ -222,119 +141,97 @@ def wait_for_server(timeout=60):
                 return True
         except Exception:
             pass
-        print("...waiting for Ollama server...", flush=True)
-        time.sleep(2)
+        time.sleep(1)
     return False
 
-# -------------------- Sanitizer & Presentation --------------------
-def sanitize(text):
-    lower = text.lower()
-    if any(f in lower for f in FORBIDDEN_FRAGMENTS):
-        for frag in FORBIDDEN_FRAGMENTS:
-            if frag in lower:
-                text = text.replace(frag, "droid subsystem", 1)
-    text = text.replace("I am Joshua", "I am K-14T").replace("I'm Joshua", "I'm K-14T")
-    return text
+def call_model(model, prompt, cfg, fast_mode=False):
+    npredict = 40 if fast_mode else int(cfg.get("num_predict", 60))
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "num_predict": npredict,
+            "temperature": cfg.get("temperature", 0.6),
+            "top_p": cfg.get("top_p", 0.9)
+        }
+    }
+    t0 = time.time()
+    r = requests.post(API_GENERATE, json=payload)
+    r.raise_for_status()
+    t1 = time.time()
+    resp = r.json().get("response", "").strip()
+    print(f"[TIMING] infer={t1 - t0:.2f}s")
+    return resp
 
-def compress_intro(reply, introduced_flag):
-    if introduced_flag:
-        hits = sum(k in reply.lower() for k in INTRO_KEYWORDS)
-        if hits >= 2 and len(reply.split()) > 25:
-            return reply.split(".")[0].strip()
-    return reply
-
-def to_beeps(text):
-    lowered = text.lower()
-    if any(k in lowered for k in ["yes", "affirmative", "sure", "ready"]):
-        return BEEP_VOCAB["affirmative"]
-    if any(k in lowered for k in ["no", "cannot", "won't", "not"]):
-        return BEEP_VOCAB["negative"]
-    return BEEP_VOCAB["neutral"]
-
+# -------------------- Voice Placeholder ------------------
 def speak(text, cfg):
-    if cfg.get("beeps"):
-        print(f"[BEEPS] {to_beeps(text)}")
-        return
     if not cfg.get("voice"):
         return
-    try:
-        tts = gTTS(text=text, lang="en")
-        tts.save("response.mp3")
-        os.system("mpg321 response.mp3 >/dev/null 2>&1 || "
-                  "ffplay -nodisp -autoexit response.mp3 >/dev/null 2>&1")
-    except Exception as e:
-        print(f"[WARN] TTS failed: {e}")
+    print("[VOICE suppressed in perf mode]")
 
-# -------------------- Prompt Assembly --------------------
-def build_prompt(system_persona, self_profile, memory_items, history, user_msg, callsign, lore_block=None):
-    conv_lines = [f"{role}: {txt}" for role, txt in history]
-    conv_text = "\n".join(conv_lines)
+# -------------------- Prompt Build -----------------------
+def build_prompt(history, mem_facts, user_msg, callsign,
+                 full_persona="", use_micro=False):
+    """
+    Only include ONE of: full_persona (once) or micro persona (if use_micro True).
+    """
+    parts = []
+    if full_persona:
+        parts.append(full_persona)
+    elif use_micro and MICRO_PERSONA:
+        parts.append(MICRO_PERSONA)
 
-    relevant = select_relevant(memory_items, user_msg, max_total=10)
-    if relevant:
-        mem_lines = [f"- {m['fact']}" for m in relevant]
-        memory_block = "<MEMORY>\n" + "\n".join(mem_lines) + "\n</MEMORY>\n"
-    else:
-        memory_block = ""
+    if mem_facts:
+        parts.append("[MEM: " + "; ".join(mem_facts) + "]")
 
-    lore_section = f"<LORE>\n{lore_block}\n</LORE>\n" if lore_block else ""
-    profile_line = ""
-    if self_profile:
-        profile_line = f"(Self profile: designation {self_profile.get('designation','K-14T')}, nickname {self_profile.get('nickname','Kay')})\n"
+    if history:
+        parts.append("\n".join(f"{r}: {t}" for r, t in history))
 
-    prompt = f"""{system_persona.strip()}
+    parts.append(f"User ({callsign}): {user_msg}")
+    parts.append("K-14T:")
+    return "\n".join(p for p in parts if p).strip()
 
-{profile_line}{memory_block}{lore_section}<CONVERSATION>
-{conv_text}
-</CONVERSATION>
+# -------------------- Reply Processing -------------------
+def trim_sentences(reply, max_sentences=2):
+    seps = reply.replace("!", ".").replace("?", ".")
+    segs = [s.strip() for s in seps.split(".") if s.strip()]
+    if len(segs) <= max_sentences:
+        return reply.strip()
+    return ". ".join(segs[:max_sentences]) + "."
 
-User ({callsign}): {user_msg}
-K-14T:"""
-    return prompt
+def sanitize(reply):
+    low = reply.lower()
+    for bad in ("as an ai", "language model", "i am an ai"):
+        if bad in low:
+            reply = reply.replace(bad, "")
+    return reply.strip()
 
-# -------------------- LLM Call --------------------
-def call_model(model, prompt, stream=False):
-    payload = {"model": model, "prompt": prompt, "stream": stream}
-    r = requests.post(API_GENERATE, json=payload)
-    if r.status_code == 404:
-        avail = fetch_available_models()
-        raise RuntimeError(f"Model '{model}' not available. Installed: {', '.join(avail) or 'none'}")
-    r.raise_for_status()
-    return r.json().get("response", "").strip()
-
-# -------------------- Main Loop --------------------
+# -------------------- Main Loop --------------------------
 def main():
     if not wait_for_server():
-        print("Could not reach Ollama server. Exiting.")
+        print("[ERROR] Ollama server not reachable.")
         sys.exit(1)
 
     cfg = load_config()
-    persona_text = load_persona()
-    self_profile = load_self_profile()
-    available = fetch_available_models()
+    full_persona = load_full_persona()
+    load_memory()
 
-    parser = argparse.ArgumentParser(description="K-14T Interactive Droid Loop")
-    parser.add_argument("--model", "-m", help="Override model name")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", "-m", help="Override model")
     args = parser.parse_args()
 
-    requested_model = args.model if args.model else cfg.get("model", "phi:latest")
-    model = resolve_model(requested_model, available)
-    cfg["model"] = model
-    save_config(cfg)
-
+    model = args.model if args.model else cfg.get("model", "phi:latest")
     callsign = cfg.get("callsign", "Joshua")
 
-    print(f"K-14T online. Using model: {model}")
-    print("Commands: /reload, /model <name>, /callsign <name>, /remember <fact>, /mem, /forget, /forgetlast, /beeps, /voice, /exit\n")
+    print(f"K-14T loop online. Model: {model}")
+    print("Commands: /model <m>, /callsign <name>, /remember <fact>, /mem, /fast, /reload, /exit")
 
-    history_limit = int(cfg.get("history_turns", 6))
-    history = deque(maxlen=history_limit * 2)
-    introduced = False
-
-    # Memory suggestion state
-    last_suggest_time = 0
-    cooldown = int(cfg.get("memory_suggest_cooldown", 120))
-    auto_memory = bool(cfg.get("auto_memory", False))
+    history_turns = int(cfg.get("history_turns", 2))
+    history = deque(maxlen=history_turns * 2 * 2)  # user+assistant pairs
+    fast_mode = False
+    first_turn = True
+    user_turn_counter = 0  # counts user *content* turns
 
     while True:
         try:
@@ -344,25 +241,20 @@ def main():
 
         if not user:
             continue
-
         lower = user.lower()
 
-        # ---- Commands ----
+        # ---------- Commands ----------
         if lower in ("/exit", "exit", "/quit", "quit"):
-            farewell = f"Powering down, {callsign}. Stay safe."
-            print(f"K-14T: {farewell}")
-            speak(farewell, cfg)
+            print(f"K-14T: Shutdown sequence, {callsign}.")
             break
 
         if user.startswith("/model"):
             parts = user.split(maxsplit=1)
             if len(parts) == 2:
-                new_req = parts[1].strip()
-                avail = fetch_available_models()
-                model = resolve_model(new_req, avail)
+                model = parts[1].strip()
                 cfg["model"] = model
                 save_config(cfg)
-                print(f"[INFO] Switched to model '{model}' (available: {', '.join(avail) or 'none'})")
+                print(f"[INFO] Model -> {model}")
             else:
                 print("Usage: /model <name>")
             continue
@@ -373,7 +265,7 @@ def main():
                 callsign = parts[1].strip()
                 cfg["callsign"] = callsign
                 save_config(cfg)
-                print(f"[INFO] Callsign set to '{callsign}'")
+                print(f"[INFO] Callsign -> {callsign}")
             else:
                 print("Usage: /callsign <name>")
             continue
@@ -383,138 +275,79 @@ def main():
             if len(parts) == 2:
                 fact = parts[1].strip()
                 stored = append_memory(fact)
-                print(f"[MEM] {'Stored' if stored else 'Already existed'}: {fact}")
+                print(f"[MEM] {'Stored' if stored else 'Duplicate'}: {fact}")
             else:
                 print("Usage: /remember <fact>")
             continue
 
         if lower == "/mem":
-            mem_items = load_memory()
-            if not mem_items:
-                print("[MEM] (no stored facts)")
+            if not _memory_cache:
+                print("[MEM] (none)")
             else:
                 print("[MEM]")
-                for i, itm in enumerate(mem_items, 1):
-                    print(f" {i}. ({itm.get('category')}) {itm['fact']}")
+                for i, fct in enumerate(_memory_cache[-25:], 1):
+                    print(f" {i}. {fct}")
             continue
 
-        if lower == "/forgetlast":
-            print("[MEM] Last fact removed." if forget_last() else "[MEM] Nothing to remove.")
-            continue
-
-        if lower == "/forget":
-            confirm = input("Confirm wipe ALL memory? (yes/no): ").strip().lower()
-            if confirm == "yes":
-                forget_all()
-                print("[MEM] All facts erased.")
+        if lower == "/fast":
+            fast_mode = not fast_mode
+            if fast_mode:
+                print("[MODE] Fast ON (num_predict=40; voice off).")
             else:
-                print("[MEM] Wipe cancelled.")
+                print("[MODE] Fast OFF.")
             continue
 
         if lower == "/reload":
             cfg = load_config()
             callsign = cfg.get("callsign", callsign)
-            avail = fetch_available_models()
-            model = resolve_model(cfg.get("model", model), avail)
-            cooldown = int(cfg.get("memory_suggest_cooldown", cooldown))
-            auto_memory = bool(cfg.get("auto_memory", auto_memory))
-            print(f"[INFO] Config & model reloaded → {model}")
-            continue
-
-        if lower == "/beeps":
-            cfg["beeps"] = not cfg.get("beeps")
-            save_config(cfg)
-            print(f"[INFO] Beep mode {'ON' if cfg['beeps'] else 'OFF'}")
-            continue
-
-        if lower == "/voice":
-            cfg["voice"] = not cfg.get("voice")
-            save_config(cfg)
-            print(f"[INFO] Voice output {'enabled' if cfg['voice'] else 'disabled'}")
+            full_persona = load_full_persona()
+            first_turn = True  # re-inject full persona after reload
+            print("[INFO] Config + persona reloaded (will inject full persona next turn).")
             continue
 
         if user.startswith("/"):
             print("[WARN] Unknown command.")
             continue
 
-        # ---- Memory Suggestion Detection ----
-        memory_items_full = load_memory()
-        candidate = detect_fact_candidate(user)
-        pending_candidate = None
-        if candidate:
-            now = time.time()
-            if now - last_suggest_time >= cooldown:
-                last_suggest_time = now
-                if auto_memory:
-                    stored = append_memory(candidate)
-                    print(f"[AUTO-MEM] {'Stored' if stored else 'Duplicate ignored'}: {candidate}")
-                    memory_items_full = load_memory()  # refresh
-                else:
-                    pending_candidate = candidate
+        # ---------- Build Prompt ----------
+        t_build_start = time.time()
+        mem_facts = select_relevant(user, limit=3)
 
-        # ---- Build Prompt ----
-        lore_block = None  # future RAG placeholder
-        prompt = build_prompt(
-            persona_text,
-            self_profile,
-            memory_items_full,
-            history,
-            user,
-            callsign,
-            lore_block=lore_block
-        )
+        user_turn_counter += 1
 
-        # ---- Call Model ----
-        try:
-            reply = call_model(model, prompt, stream=False)
-        except Exception as e:
-            print(f"K-14T ERROR: {e}")
-            continue
+        # Decide persona usage
+        if first_turn:
+            prompt = build_prompt(history, mem_facts, user, callsign,
+                                  full_persona=full_persona, use_micro=False)
+        else:
+            use_micro = False
+            if INJECT_MICRO_PERSONA_ALWAYS:
+                use_micro = True
+            else:
+                if REMINDER_INTERVAL > 0 and user_turn_counter % REMINDER_INTERVAL == 0:
+                    use_micro = True
+            prompt = build_prompt(history, mem_facts, user, callsign,
+                                  full_persona="", use_micro=use_micro)
 
-        reply = sanitize(reply)
-        reply = compress_intro(reply, introduced)
+        t_build_end = time.time()
 
-        if not introduced and any(k in reply.lower() for k in INTRO_KEYWORDS):
-            introduced = True
+        if first_turn:
+            first_turn = False  # full persona will not be resent
 
-        if not cfg.get("beeps"):
-            if "*chirp*" not in reply.lower() and "*whirr*" not in reply.lower():
-                if hash(reply) % 5 == 0:
-                    reply += " *chirp*"
+        # ---------- Inference ----------
+        reply_raw = call_model(model, prompt, cfg, fast_mode=fast_mode)
+        reply = sanitize(reply_raw)
+        reply = trim_sentences(reply, max_sentences=2)
 
-        words = reply.split()
-        if len(words) > MAX_WORDS:
-            reply = " ".join(words[:MAX_WORDS]) + " ..."
-
-        if (not auto_memory) and pending_candidate:
-            if "(remember?" not in reply.lower():
-                reply += f" (remember? /remember {pending_candidate})"
-
-        # Simple triggered suggestion when user expresses preference again
-        if any(t in user.lower() for t in ["i like", "i prefer"]) and "(remember?" not in reply.lower():
-            # Already handled by detection; no extra annotation needed beyond above.
-
-            pass
+        t_total_end = time.time()
+        print(f"[TIMING] build={t_build_end - t_build_start:.2f}s total={t_total_end - t_build_start:.2f}s "
+              f"prompt_tokens≈{len(prompt.split())}")
 
         print(f"K-14T: {reply}")
         speak(reply, cfg)
 
         history.append(("User", user))
         history.append(("K-14T", reply))
-
-        # ---- Log Turn ----
-        try:
-            with open(LOGS_DIR / "dialog.log", "a", encoding="utf-8") as f:
-                json.dump({
-                    "ts": time.time(),
-                    "model": model,
-                    "callsign": callsign,
-                    "user": user,
-                    "reply": reply
-                }, f)
-                f.write("\n")
-        except Exception:
-            pass
 
 if __name__ == "__main__":
     main()
