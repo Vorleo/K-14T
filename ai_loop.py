@@ -32,7 +32,7 @@ DEFAULT_CONFIG = {
     "model": "phi:latest",
     "history_turns": 2,
     "callsign": "Joshua",
-    "voice": False,
+    "voice": True,
     "beeps": False,
     "num_predict": 60,
     "temperature": 0.6,
